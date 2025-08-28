@@ -56,6 +56,7 @@ class User(Base):
     username = Column(String, unique=True, index=True)
     email = Column(String, unique=True, index=True)
     password_hash = Column(String)
+    phone_number = Column(String, nullable=True)  # NEW FIELD
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -273,10 +274,11 @@ def login(
         "status": "1",
         "message": "Login successful",
         "result": {
-            "Token": token,
             "user_id": user.id,
             "username": user.username,
-            "email": user.email
+            "email": user.email,
+            "phone_number": user.phone_number
+           
         }
     }
 
@@ -544,45 +546,221 @@ class UserResponse(BaseModel):
 
 
 # GET - Retrieve User by ID
-@app.get("/users/{user_id}", response_model=UserResponse)
-async def get_user(user_id: int, db: Session = Depends(get_db)):
-    db_user = db.query(User).filter(User.id == user_id).first()
-    if db_user is None:
-        raise HTTPException(status_code=404, detail="User not found")
-    return db_user
+# @app.get("/users/{user_id}", response_model=UserResponse)
+# async def get_user(user_id: int, db: Session = Depends(get_db)):
+#     db_user = db.query(User).filter(User.id == user_id).first()
+#     if db_user is None:
+#         raise HTTPException(status_code=404, detail="User not found")
+#     return db_user
 
-# PUT - Update User by ID
-@app.patch("/users/{user_id}", response_model=UserResponse)
-async def update_user(
-    user_id: int,
-    username: Optional[str] = Form(None),
-    email: Optional[str] = Form(None),
-    is_active: Optional[bool] = Form(None),
-    db: Session = Depends(get_db),
-):
-    db_user = db.query(User).filter(User.id == user_id).first()
+# # PUT - Update User by ID
+# @app.patch("/users/{user_id}", response_model=UserResponse)
+# async def update_user(
+#     user_id: int,
+#     username: Optional[str] = Form(None),
+#     email: Optional[str] = Form(None),
+#     is_active: Optional[bool] = Form(None),
+#     db: Session = Depends(get_db),
+# ):
+#     db_user = db.query(User).filter(User.id == user_id).first()
 
-    if db_user is None:
-        raise HTTPException(status_code=404, detail="User not found")
+#     if db_user is None:
+#         raise HTTPException(status_code=404, detail="User not found")
 
-    # Update the fields if provided
-    if username:
-        db_user.username = username
-    if email:
-        # Check if email is already taken by another user
-        existing_user = db.query(User).filter(User.email == email).first()
-        if existing_user and existing_user.id != user_id:
-            raise HTTPException(status_code=400, detail="Email already in use by another user")
-        db_user.email = email
-    if is_active is not None:
-        db_user.is_active = is_active
+#     # Update the fields if provided
+#     if username:
+#         db_user.username = username
+#     if email:
+#         # Check if email is already taken by another user
+#         existing_user = db.query(User).filter(User.email == email).first()
+#         if existing_user and existing_user.id != user_id:
+#             raise HTTPException(status_code=400, detail="Email already in use by another user")
+#         db_user.email = email
+#     if is_active is not None:
+#         db_user.is_active = is_active
 
-    db.commit()
-    db.refresh(db_user)
-    return db_user
+#     db.commit()
+#     db.refresh(db_user)
+#     return db_user
 
-# Exception Handling
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request, exc: HTTPException):
-    return {"status": 0, "message": exc.detail, "result": None}
+# # Exception Handling
+# @app.exception_handler(HTTPException)
+# async def http_exception_handler(request, exc: HTTPException):
+#     return {"status": 0, "message": exc.detail, "result": None}
 
+
+from fastapi import FastAPI, Depends, HTTPException
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
+from typing import Optional
+
+@app.get("/users/{user_id}")
+def get_user(user_id: int, db: Session = Depends(get_db)):
+    try:
+        # Retrieve the user by user_id
+        user = db.query(User).filter_by(id=user_id).first()
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Return user data (exclude password_hash for security reasons)
+        return {
+            "username": user.username,
+            "email": user.email,
+            "phone_number": user.phone_number,
+            "created_at": user.created_at
+        }
+    
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve user: {str(e)}")
+    
+
+from fastapi import FastAPI, Depends, HTTPException, Form
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
+from typing import Optional
+
+from hashlib import sha256
+
+
+
+@app.put("/users/{user_id}")
+def update_user(user_id: int, 
+                username: Optional[str] = Form(None),
+                email: Optional[str] = Form(None),
+                phone_number: Optional[str] = Form(None),
+                db: Session = Depends(get_db)):
+    try:
+        # Retrieve the user by user_id
+        user = db.query(User).filter_by(id=user_id).first()
+
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        # Update fields if provided
+        if username is not None:
+            user.username = username
+        if email is not None:
+            user.email = email
+        if phone_number is not None:
+            user.phone_number = phone_number
+
+        db.commit()
+
+        return {"status": "1", "message": "User details updated successfully"}
+    
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to update user: {str(e)}")
+
+
+# Google Login 
+
+import os
+from fastapi import FastAPI, HTTPException, Depends, Form
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+from google.auth.transport.requests import Request
+from google.oauth2.id_token import verify_oauth2_token
+from datetime import datetime
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+from sqlalchemy import Column, Integer, String, Boolean, DateTime
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Secret key to encode JWT tokens
+SECRET_KEY = "your-jwt-secret-key"
+ALGORITHM = "HS256"
+
+# Google client ID for OAuth
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+
+# Function to create JWT token
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    to_encode.update({"exp": datetime.utcnow() + timedelta(minutes=30)})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+# Function to verify Google token
+from google.auth.transport.requests import Request
+from google.oauth2 import id_token
+from fastapi import HTTPException
+
+# Using the GOOGLE_CLIENT_ID variable
+GOOGLE_CLIENT_ID = "526959144743-qmpd0hj10tvbq8pdqp17a1j2o14krgt7.apps.googleusercontent.com"
+
+def verify_google_token(id_token_str: str):
+    try:
+        # The audience should be your Google Client ID
+        target_audience = GOOGLE_CLIENT_ID  # Use the GOOGLE_CLIENT_ID here
+        
+        # Create a request object for validation
+        request = Request()
+
+        # Verify the token
+        decoded_token = id_token.verify_oauth2_token(id_token_str, request, audience=target_audience)
+
+        # Return the decoded token (which contains user info)
+        return decoded_token
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=f"Token verification failed: {str(e)}")
+
+
+
+# Pydantic model for Google login response
+class GoogleLoginResponse(BaseModel):
+    access_token: str
+    token_type: str
+    user_id: int
+    full_name: str
+
+# Google Login API endpoint
+from fastapi import Body
+
+class GoogleLoginRequest(BaseModel):
+    id_token: str
+
+from fastapi.responses import JSONResponse
+
+@app.post("/login/google")
+async def google_login(request: GoogleLoginRequest, db: Session = Depends(get_db)):
+    try:
+        google_user = verify_google_token(request.id_token)
+        # Log or check the google_user data
+    except Exception as e:
+        return {"status": "0", "message": f"Token verification failed: {str(e)}", "result": {}}
+
+    user = db.query(User).filter(User.email == google_user["email"]).first()
+
+    if not user:
+        user = User(
+            email=google_user["email"],
+            full_name=google_user["name"],
+            profile_photo=google_user.get("picture"),
+            is_active=True,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    token = create_access_token({"sub": user.email})
+
+    return {
+        "status": "1", 
+        "message": "Google login successful", 
+        "result": {
+            "access_token": token, 
+            "token_type": "bearer", 
+            "user_id": user.id, 
+            "full_name": user.full_name
+        }
+    }
