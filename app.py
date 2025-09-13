@@ -79,8 +79,19 @@ class SilentModeSchedule(Base):
     to_time = Column(String)
     days = Column(String)
     active = Column(Boolean, default=True)
+    is_timer_enabled = Column(Boolean, default=False)  # Add this field
+    is_calendar_event = Column(Boolean, default=False)  # default custom
 
     user = relationship("User", back_populates="schedules")
+
+class SignupOTP(Base):
+    __tablename__ = "signup_otps"
+    id = Column(Integer, primary_key=True)
+    email = Column(String, unique=True, index=True, nullable=False)
+    username = Column(String, nullable=False)
+    password_hash = Column(String, nullable=False)
+    otp = Column(String, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
 
 Base.metadata.create_all(bind=engine)
 
@@ -167,7 +178,7 @@ pending_resets = {}
 # Routes
 @app.get("/")
 def index():
-    return {"status": "1", "message": "✅ SilentFocus is Live"}
+    return {"status": "1", "message": "? SilentFocus is Live"}
 
 @app.post("/signup")
 async def signup(
@@ -179,9 +190,6 @@ async def signup(
     if not validate_email(email):
         return {"status": "0", "message": "Invalid email format."}
 
-    if pending_signups.get(email):
-        return {"status": "0", "message": "Pending OTP verification already initiated."}
-
     if db.query(User).filter(User.email == email).first():
         return {"status": "0", "message": "Account already exists."}
 
@@ -189,16 +197,25 @@ async def signup(
     # if db.query(User).filter(User.username == username).first():
     #     return {"status": "0", "message": "Username already taken."}
 
-    otp = str(random.randint(100000, 999999))
+    otp = str(random.randint(1000, 9999))
     password_hash = get_password_hash(password)
 
-    pending_signups[email] = {
-        "email": email,
-        "username": username,
-        "password_hash": password_hash,
-        "otp": otp,
-        "expires_at": datetime.utcnow() + timedelta(minutes=10)
-    }
+    existing = db.query(SignupOTP).filter(SignupOTP.email == email).first()
+    if existing:
+        existing.username = username
+        existing.password_hash = password_hash
+        existing.otp = otp
+        existing.expires_at = datetime.utcnow() + timedelta(minutes=10)
+    else:
+        pending_row = SignupOTP(
+            email=email,
+            username=username,
+            password_hash=password_hash,
+            otp=otp,
+            expires_at=datetime.utcnow() + timedelta(minutes=10),
+        )
+        db.add(pending_row)
+    db.commit()
 
     send_otp_email(email, otp)
 
@@ -215,35 +232,39 @@ async def verify_otp(
     otp: str = Form(...),
     db: Session = Depends(get_db)
 ):
-    pending = pending_signups.get(email)
-    if not pending:
+    pending_row = db.query(SignupOTP).filter(SignupOTP.email == email).first()
+    if not pending_row:
         return {"status": "0", "message": "No OTP found for this email."}
 
-    if pending["otp"] != otp:
+    if pending_row.otp != otp:
         return {"status": "0", "message": "Incorrect OTP."}
 
-    if datetime.utcnow() > pending["expires_at"]:
-        del pending_signups[email]
+    if datetime.utcnow() > pending_row.expires_at:
+        db.delete(pending_row)
+        db.commit()
         return {"status": "0", "message": "OTP expired."}
 
     if db.query(User).filter(User.email == email).first():
-        del pending_signups[email]
+        db.delete(pending_row)
+        db.commit()
         return {"status": "0", "message": "Email already registered."}
-    if db.query(User).filter(User.username == pending["username"]).first():
-        del pending_signups[email]
+    if db.query(User).filter(User.username == pending_row.username).first():
+        db.delete(pending_row)
+        db.commit()
         return {"status": "0", "message": "Username already taken."}
 
     user = User(
-        email=pending["email"],
-        username=pending["username"],
-        password_hash=pending["password_hash"]
+        email=pending_row.email,
+        username=pending_row.username,
+        password_hash=pending_row.password_hash
     )
 
     db.add(user)
     db.commit()
     db.refresh(user)
 
-    del pending_signups[email]
+    db.delete(pending_row)
+    db.commit()
 
     return {
         "status": "1",
@@ -284,46 +305,33 @@ def login(
 
 @app.post("/resend-otp")
 async def resend_otp(email: str = Form(...)):
-    pending = pending_signups.get(email)
-    if not pending:
+    # Note: DB session is required for OTP persistence
+    # Create a short-lived session for this utility endpoint
+    db = SessionLocal()
+    try:
+        pending_row = db.query(SignupOTP).filter(SignupOTP.email == email).first()
+        if not pending_row:
+            return {
+                "status": "0",
+                "message": "No pending signup found for this email."
+            }
+
+        new_otp = str(random.randint(1000, 9999))
+        pending_row.otp = new_otp
+        pending_row.expires_at = datetime.utcnow() + timedelta(minutes=10)
+        db.commit()
+
+        send_otp_email(email, new_otp)
+
         return {
-            "status": "0",
-            "message": "No pending signup found for this email."
+            "status": "1",
+            "message": "OTP resent to email",
+            "result": {"email": email}
         }
-
-    new_otp = str(random.randint(100000, 999999))
-    pending["otp"] = new_otp
-    pending["expires_at"] = datetime.utcnow() + timedelta(minutes=10)
-
-    send_otp_email(email, new_otp)
-
-    return {
-        "status": "1",
-        "message": "OTP resent to email",
-        "result": {"email": email}
-    }
+    finally:
+        db.close()
 
 
-@app.post("/resend-otp")
-async def resend_otp(email: str = Form(...)):
-    pending = pending_signups.get(email)
-    if not pending:
-        return {
-            "status": "0",
-            "message": "No pending signup found for this email."
-        }
-
-    new_otp = str(random.randint(100000, 999999))
-    pending["otp"] = new_otp
-    pending["expires_at"] = datetime.utcnow() + timedelta(minutes=10)
-
-    send_otp_email(email, new_otp)
-
-    return {
-        "status": "1",
-        "message": "OTP resent to email",
-        "result": {"email": email}
-    }
 
 @app.post("/forgot-password")
 async def forgot_password(
@@ -340,7 +348,7 @@ async def forgot_password(
         return {"status": "0", "message": "User not found."}
 
     # Generate a 6-digit OTP
-    otp = str(random.randint(100000, 999999))
+    otp = str(random.randint(1000, 9999))
 
     # Store OTP in memory
     pending_resets[email] = {
@@ -414,111 +422,6 @@ async def create_new_password(
     return {"status": "1", "message": "Password reset successfully"}
 
 
-
-
-# ---------------------- Routes ----------------------
-
-# @app.post("/api/silent-mode/toggle")
-# def toggle_silent_mode(
-#     userId: int = Form(...),
-#     silentMode: bool = Form(...),
-#     db: Session = Depends(get_db)
-# ):
-#     user = db.query(User).filter(User.id == userId).first()
-#     if not user:
-#         raise HTTPException(status_code=404, detail="User not found")
-
-#     status = db.query(SilentModeStatus).filter_by(user_id=user.id).first()
-#     if not status:
-#         status = SilentModeStatus(user_id=user.id, silent_mode=silentMode)
-#         db.add(status)
-#     else:
-#         status.silent_mode = silentMode
-#     db.commit()
-#     return {"success": True, "message": f"Silent Mode turned {'ON' if silentMode else 'OFF'}"}
-
-# @app.get("/api/silent-mode/status", response_model=SilentModeStatusResponse)
-# def get_status(userId: int, db: Session = Depends(get_db)):
-#     user = db.query(User).filter(User.id == userId).first()
-#     if not user:
-#         raise HTTPException(status_code=404, detail="User not found")
-
-#     status = db.query(SilentModeStatus).filter_by(user_id=userId).first()
-#     silent_mode = status.silent_mode if status else False
-
-#     schedule = db.query(SilentModeSchedule).filter_by(user_id=userId, active=True).first()
-#     active_schedule = {
-#         "from": schedule.from_time,
-#         "to": schedule.to_time,
-#         "days": schedule.days.split(",")
-#     } if schedule else None
-
-#     return {"silentMode": silent_mode, "activeSchedule": active_schedule}
-
-# @app.post("/api/silent-mode/schedule")
-# def create_schedule(
-#     userId: int = Form(...),
-#     from_time: str = Form(...),
-#     to_time: str = Form(...),
-#     days: str = Form(...),  # Pass as comma-separated string: "Mon,Tue,Wed"
-#     db: Session = Depends(get_db)
-# ):
-#     user = db.query(User).filter(User.id == userId).first()
-#     if not user:
-#         raise HTTPException(status_code=404, detail="User not found")
-
-#     new_schedule = SilentModeSchedule(
-#         user_id=userId,
-#         from_time=from_time,
-#         to_time=to_time,
-#         days=days
-#     )
-#     db.add(new_schedule)
-#     db.commit()
-#     return {"success": True, "message": "Schedule created", "scheduleId": new_schedule.id}
-
-# @app.get("/api/silent-mode/schedules", response_model=List[ScheduleResponse])
-# def get_schedules(userId: int, db: Session = Depends(get_db)):
-#     user = db.query(User).filter(User.id == userId).first()
-#     if not user:
-#         raise HTTPException(status_code=404, detail="User not found")
-
-#     user_schedules = db.query(SilentModeSchedule).filter_by(user_id=userId).all()
-#     return [
-#         ScheduleResponse(
-#             id=s.id,
-#             from_time=s.from_time,
-#             to_time=s.to_time,
-#             days=s.days.split(","),
-#             active=s.active
-#         ) for s in user_schedules
-#     ]
-
-# @app.post("/api/silent-mode/schedule/toggle")
-# def toggle_schedule(
-#     scheduleId: str = Form(...),
-#     active: bool = Form(...),
-#     db: Session = Depends(get_db)
-# ):
-#     schedule = db.query(SilentModeSchedule).filter_by(id=scheduleId).first()
-#     if not schedule:
-#         raise HTTPException(status_code=404, detail="Schedule not found")
-
-#     schedule.active = active
-#     db.commit()
-#     return {"success": True, "message": f"Schedule {'enabled' if active else 'disabled'}"}
-
-# @app.delete("/api/silent-mode/schedule/{scheduleId}")
-# def delete_schedule(scheduleId: str, db: Session = Depends(get_db)):
-#     schedule = db.query(SilentModeSchedule).filter_by(id=scheduleId).first()
-#     if not schedule:
-#         raise HTTPException(status_code=404, detail="Schedule not found")
-#     db.delete(schedule)
-#     db.commit()
-#     return {"success": True, "message": "Schedule deleted"}
-
-
-
 from fastapi import FastAPI, HTTPException, Depends, Form
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
@@ -543,50 +446,6 @@ class UserResponse(BaseModel):
 
 
 # POST - Create a User (using FormData)
-
-
-# GET - Retrieve User by ID
-# @app.get("/users/{user_id}", response_model=UserResponse)
-# async def get_user(user_id: int, db: Session = Depends(get_db)):
-#     db_user = db.query(User).filter(User.id == user_id).first()
-#     if db_user is None:
-#         raise HTTPException(status_code=404, detail="User not found")
-#     return db_user
-
-# # PUT - Update User by ID
-# @app.patch("/users/{user_id}", response_model=UserResponse)
-# async def update_user(
-#     user_id: int,
-#     username: Optional[str] = Form(None),
-#     email: Optional[str] = Form(None),
-#     is_active: Optional[bool] = Form(None),
-#     db: Session = Depends(get_db),
-# ):
-#     db_user = db.query(User).filter(User.id == user_id).first()
-
-#     if db_user is None:
-#         raise HTTPException(status_code=404, detail="User not found")
-
-#     # Update the fields if provided
-#     if username:
-#         db_user.username = username
-#     if email:
-#         # Check if email is already taken by another user
-#         existing_user = db.query(User).filter(User.email == email).first()
-#         if existing_user and existing_user.id != user_id:
-#             raise HTTPException(status_code=400, detail="Email already in use by another user")
-#         db_user.email = email
-#     if is_active is not None:
-#         db_user.is_active = is_active
-
-#     db.commit()
-#     db.refresh(db_user)
-#     return db_user
-
-# # Exception Handling
-# @app.exception_handler(HTTPException)
-# async def http_exception_handler(request, exc: HTTPException):
-#     return {"status": 0, "message": exc.detail, "result": None}
 
 
 from fastapi import FastAPI, Depends, HTTPException
@@ -660,107 +519,466 @@ def update_user(user_id: int,
         raise HTTPException(status_code=500, detail=f"Failed to update user: {str(e)}")
 
 
-# Google Login 
-
-import os
-from fastapi import FastAPI, HTTPException, Depends, Form
-from sqlalchemy.orm import Session
-from pydantic import BaseModel
-from google.auth.transport.requests import Request
-from google.oauth2.id_token import verify_oauth2_token
-from datetime import datetime
-from passlib.context import CryptContext
-from jose import JWTError, jwt
-from sqlalchemy import Column, Integer, String, Boolean, DateTime
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
-
-# Secret key to encode JWT tokens
-SECRET_KEY = "your-jwt-secret-key"
-ALGORITHM = "HS256"
-
-# Google client ID for OAuth
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
-
-# Function to create JWT token
-def create_access_token(data: dict):
-    to_encode = data.copy()
-    to_encode.update({"exp": datetime.utcnow() + timedelta(minutes=30)})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-# Function to verify Google token
-from google.auth.transport.requests import Request
-from google.oauth2 import id_token
-from fastapi import HTTPException
-
-# Using the GOOGLE_CLIENT_ID variable
-GOOGLE_CLIENT_ID = "526959144743-qmpd0hj10tvbq8pdqp17a1j2o14krgt7.apps.googleusercontent.com"
-
-def verify_google_token(id_token_str: str):
-    try:
-        # The audience should be your Google Client ID
-        target_audience = GOOGLE_CLIENT_ID  # Use the GOOGLE_CLIENT_ID here
-        
-        # Create a request object for validation
-        request = Request()
-
-        # Verify the token
-        decoded_token = id_token.verify_oauth2_token(id_token_str, request, audience=target_audience)
-
-        # Return the decoded token (which contains user info)
-        return decoded_token
-    except ValueError as e:
-        raise HTTPException(status_code=401, detail=f"Token verification failed: {str(e)}")
 
 
+from fastapi import Query
 
-# Pydantic model for Google login response
-class GoogleLoginResponse(BaseModel):
-    access_token: str
-    token_type: str
-    user_id: int
-    full_name: str
+# ---------------- Silent Mode Schedule APIs ---------------- #
 
-# Google Login API endpoint
-from fastapi import Body
 
-class GoogleLoginRequest(BaseModel):
-    id_token: str
-
+from fastapi import FastAPI, Form, Depends
 from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
+from datetime import datetime
+from typing import List
 
-@app.post("/login/google")
-async def google_login(request: GoogleLoginRequest, db: Session = Depends(get_db)):
-    try:
-        google_user = verify_google_token(request.id_token)
-        # Log or check the google_user data
-    except Exception as e:
-        return {"status": "0", "message": f"Token verification failed: {str(e)}", "result": {}}
 
-    user = db.query(User).filter(User.email == google_user["email"]).first()
+# Helper: parse HH:MM (24 hrs)
+# def parse_time_24hrs(time_str: str):
+#     try:
+#         return datetime.strptime(time_str, "%H:%M").time()
+#     except ValueError:
+#         raise ValueError("Invalid time format. Use HH:MM in 24-hr format (e.g., 13:30)")
 
+def parse_time_24hrs(time_str: str):
+    time_str = time_str.strip()  # remove spaces
+    
+    # Handle various time formats
+    time_formats = [
+        "%H:%M",        # 13:30
+        "%H:%M:%S",     # 13:30:00
+        "%H.%M",        # 13.30
+        "%H.%M.%S",     # 13.30.00
+        "%H %M",        # 13 30
+        "%H %M %S",     # 13 30 00
+        "%I:%M %p",     # 1:30 PM
+        "%I:%M:%S %p",  # 1:30:00 PM
+        "%I.%M %p",     # 1.30 PM
+        "%I.%M.%S %p",  # 1.30.00 PM
+        "%I %M %p",     # 1 30 PM
+        "%I %M %S %p",  # 1 30 00 PM
+    ]
+    
+    for fmt in time_formats:
+        try:
+            parsed_time = datetime.strptime(time_str, fmt).time()
+            return parsed_time
+        except ValueError:
+            continue
+    
+    # If no format matches, try to extract numbers and construct time
+    import re
+    numbers = re.findall(r'\d+', time_str)
+    if len(numbers) >= 2:
+        try:
+            hour = int(numbers[0])
+            minute = int(numbers[1])
+            second = int(numbers[2]) if len(numbers) >= 3 else 0
+            
+            # Handle 12-hour format if PM/AM is present
+            if any(period in time_str.upper() for period in ['AM', 'PM']):
+                if 'PM' in time_str.upper() and hour != 12:
+                    hour += 12
+                elif 'AM' in time_str.upper() and hour == 12:
+                    hour = 0
+            
+            if 0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59:
+                return datetime.strptime(f"{hour:02d}:{minute:02d}:{second:02d}", "%H:%M:%S").time()
+        except (ValueError, IndexError):
+            pass
+    
+    raise ValueError("Invalid time format. Supported formats: HH:MM, HH:MM:SS, HH.MM, 1:30 PM, etc. (e.g., 13:30, 1:30 PM)")
+
+
+
+
+# Helper: check overlap
+def time_overlap(start1, end1, start2, end2):
+    return max(start1, start2) < min(end1, end2)
+
+# Helper: check if days overlap
+def days_overlap(days1: List[str], days2: List[str]):
+    return any(day in days2 for day in days1)
+
+
+# ========================
+# CREATE / UPDATE SCHEDULE
+# ========================
+@app.post("/scheduleTimerData")
+def create_schedule(
+    userId: int = Form(...),
+    from_time: str = Form(...),  # e.g., "09:00"
+    to_time: str = Form(...),    # e.g., "17:00"
+    days: str = Form(...),       # e.g., "Monday,Tuesday"
+    db: Session = Depends(get_db)
+):
+    # Check if user exists
+    user = db.query(User).filter(User.id == userId).first()
     if not user:
-        user = User(
-            email=google_user["email"],
-            full_name=google_user["name"],
-            profile_photo=google_user.get("picture"),
-            is_active=True,
-        )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
+        return JSONResponse(status_code=404, content={
+            "status": "0",
+            "message": "User not found.",
+            "results": []
+        })
 
-    token = create_access_token({"sub": user.email})
+    # Parse times
+    try:
+        new_from = parse_time_24hrs(from_time)
+        new_to = parse_time_24hrs(to_time)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={
+            "status": "0",
+            "message": str(e),
+            "results": []
+        })
+
+    if new_from >= new_to:
+        return JSONResponse(status_code=400, content={
+            "status": "0",
+            "message": "Start time must be before end time.",
+            "results": []
+        })
+
+    new_days = [d.strip() for d in days.split(",")]
+
+    # Fetch existing schedules
+    existing_schedules = db.query(SilentModeSchedule).filter(SilentModeSchedule.user_id == userId).all()
+
+    for sched in existing_schedules:
+        existing_days = [d.strip() for d in sched.days.split(",")]
+        overlap_days = list(set(new_days) & set(existing_days))  # common days only
+        if overlap_days:
+            existing_from = parse_time_24hrs(sched.from_time)
+            existing_to = parse_time_24hrs(sched.to_time)
+            if time_overlap(new_from, new_to, existing_from, existing_to):
+                return JSONResponse(status_code=400, content={
+                    "status": "0",
+                    "message": f"Conflict on days: {', '.join(overlap_days)}",
+                    "results": []
+                })
+
+    # Create schedule
+    schedule = SilentModeSchedule(
+        user_id=userId,
+        from_time=from_time,
+        to_time=to_time,
+        days=days,
+        active=True
+    )
+    db.add(schedule)
+    db.commit()
+    db.refresh(schedule)
 
     return {
-        "status": "1", 
-        "message": "Google login successful", 
+        "status": "1",
+        "message": "Schedule created successfully",
         "result": {
-            "access_token": token, 
-            "token_type": "bearer", 
-            "user_id": user.id, 
-            "full_name": user.full_name
+            "schedule_id": schedule.id,
+            "from_time": schedule.from_time,
+            "to_time": schedule.to_time,
+            "selected_days": schedule.days.split(","),
+            "isTimerEnabled": schedule.active
         }
+    }
+
+
+# ============
+# DELETE API
+# ============
+@app.delete("/scheduleTimerData/{schedule_id}")
+def delete_schedule(schedule_id: str, userId: int, db: Session = Depends(get_db)):
+    schedule = db.query(SilentModeSchedule).filter(
+        SilentModeSchedule.id == schedule_id,
+        SilentModeSchedule.user_id == userId
+    ).first()
+
+    if not schedule:
+        return JSONResponse(status_code=404, content={
+            "status": "0",
+            "message": "Schedule not found.",
+            "results": []
+        })
+
+    db.delete(schedule)
+    db.commit()
+
+    return {
+        "status": "1",
+        "message": "Schedule deleted successfully",
+        "result": {"deleted_schedule_id": schedule_id}
+    }
+
+
+
+# Get Schedule (only today's records)
+@app.get("/get-scheduleTimerData")
+def get_schedule(userId: int = Query(...), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == userId).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    today = datetime.today().strftime("%A")
+
+    schedules = db.query(SilentModeSchedule).filter(
+        SilentModeSchedule.user_id == userId
+    ).all()
+
+    result = []
+    for s in schedules:
+        days = [d.strip() for d in s.days.split(",")]
+        if "Everyday" in days or today in days:
+            result.append({
+                "schedule_id": s.id,
+                "from_time": s.from_time,
+                "to_time": s.to_time,
+                "selected_days": days,
+                "isTimerEnabled": s.active,
+                "event_type": "calendar" if s.is_calendar_event else "custom"
+            })
+
+    return {"status": "1", "result": result}
+
+
+
+@app.post("/post-timerSchedule")
+def toggle_schedule(
+    schedule_id: str = Form(...),
+    isTimerEnabled: bool = Form(...),
+    db: Session = Depends(get_db)
+):
+    # Normalize ID (UUIDs stored as string in SQLite)
+    schedule = db.query(SilentModeSchedule).filter(SilentModeSchedule.id == str(schedule_id)).first()
+    if not schedule:
+        return {"status": "0", "message": f"Schedule not found for id {schedule_id}"}
+
+    schedule.active = isTimerEnabled
+    db.commit()
+    db.refresh(schedule)
+
+    return {
+        "status": "1",
+        "message": "Schedule status updated",
+        "result": {
+            "schedule_id": schedule.id,
+            "isTimerEnabled": schedule.active
+        }
+    }
+
+@app.post("/logout")
+def logout(
+    user_id: int = Form(...),  # take user_id from form-urlencoded
+    db: Session = Depends(get_db)
+):
+    # Retrieve user
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    # Update all schedules: set active = False
+    schedules = db.query(SilentModeSchedule).filter(SilentModeSchedule.user_id == user.id).all()
+    for schedule in schedules:
+        schedule.active = False
+        db.add(schedule)
+
+    db.commit()
+
+    return {"status": "1", "message": "User logged out. All schedules disabled."}
+
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import requests
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+import os
+
+
+# Set MODE = "test" for mock, "live" for real verification
+MODE = os.getenv("SOCIAL_LOGIN_MODE", "test")  # default test
+
+# ?? Facebook Credentials (needed only in live mode)
+from dotenv import load_dotenv
+import os
+
+load_dotenv()  # .env file se env variables load karega
+
+FACEBOOK_APP_ID = os.getenv("FACEBOOK_APP_ID")
+FACEBOOK_APP_SECRET = os.getenv("FACEBOOK_APP_SECRET")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+
+
+class SocialLoginRequest(BaseModel):
+    provider: str
+    access_token: str
+
+
+@app.post("/v1/social-login")
+def social_login(payload: SocialLoginRequest):
+    provider = payload.provider.lower()
+    token = payload.access_token
+
+    # --------------------------
+    # TEST MODE (Mock responses)
+    # --------------------------
+    if MODE == "test":
+        if token == "invalid":
+            raise HTTPException(status_code=401, detail="Invalid access token (test)")
+        return {
+            "status": "success",
+            "provider": provider,
+            "user": {
+                "id": "test_12345",
+                "name": "Mock User",
+                "email": "mockuser@example.com"
+            }
+        }
+
+    # --------------------------
+    # LIVE MODE (Real validation)
+    # --------------------------
+    if provider == "facebook":
+        user_data = verify_facebook_token(token)
+    elif provider == "google":
+        user_data = verify_google_token(token)
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported provider")
+
+    if not user_data:
+        raise HTTPException(status_code=401, detail="Invalid or expired access token")
+
+    return {
+        "status": "success",
+        "provider": provider,
+        "user": user_data,
+    }
+
+
+# ? Facebook Token Verification (Live mode)
+def verify_facebook_token(token: str):
+    debug_url = (
+        f"https://graph.facebook.com/debug_token?"
+        f"input_token={token}&access_token={FACEBOOK_APP_ID}|{FACEBOOK_APP_SECRET}"
+    )
+    resp = requests.get(debug_url).json()
+
+    if "data" not in resp or not resp["data"].get("is_valid"):
+        return None
+
+    user_url = f"https://graph.facebook.com/me?fields=id,name,email&access_token={token}"
+    user_info = requests.get(user_url).json()
+    return user_info
+
+
+# ? Google Token Verification (Live mode)
+def verify_google_token(token: str):
+    try:
+        idinfo = id_token.verify_oauth2_token(
+            token, google_requests.Request(), GOOGLE_CLIENT_ID
+        )
+        return {
+            "id": idinfo["sub"],
+            "email": idinfo.get("email"),
+            "name": idinfo.get("name"),
+        }
+    except Exception:
+        return None
+    
+
+
+from fastapi import APIRouter, Depends, HTTPException, status, Body
+from sqlalchemy.orm import Session
+from typing import List
+from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+
+# Existing utility functions: parse_time_24hrs, time_overlap, get_db
+# Models: User, SilentModeSchedule
+
+class ScheduleItem(BaseModel):
+    userId: int
+    from_time: str  # "09:00"
+    to_time: str    # "17:00"
+    days: str       # "Monday,Tuesday"
+
+@app.post("/scheduleTimerCalendarEventData")
+def create_multiple_schedules(
+    schedules: List[ScheduleItem] = Body(...),
+    db: Session = Depends(get_db)
+):
+    created_schedules = []
+    failed_schedules = []
+
+    for item in schedules:
+        user = db.query(User).filter(User.id == item.userId).first()
+        if not user:
+            failed_schedules.append({
+                "userId": item.userId,
+                "message": "User not found."
+            })
+            continue
+
+        try:
+            new_from = parse_time_24hrs(item.from_time)
+            new_to = parse_time_24hrs(item.to_time)
+        except ValueError as e:
+            failed_schedules.append({
+                "userId": item.userId,
+                "message": str(e)
+            })
+            continue
+
+        if new_from >= new_to:
+            failed_schedules.append({
+                "userId": item.userId,
+                "message": "Start time must be before end time."
+            })
+            continue
+
+        new_days = [d.strip() for d in item.days.split(",")]
+        existing_schedules = db.query(SilentModeSchedule).filter(SilentModeSchedule.user_id == item.userId).all()
+
+        conflict = False
+        for sched in existing_schedules:
+            existing_days = [d.strip() for d in sched.days.split(",")]
+            overlap_days = list(set(new_days) & set(existing_days))
+            if overlap_days:
+                existing_from = parse_time_24hrs(sched.from_time)
+                existing_to = parse_time_24hrs(sched.to_time)
+                if time_overlap(new_from, new_to, existing_from, existing_to):
+                    failed_schedules.append({
+                        "userId": item.userId,
+                        "message": f"Conflict on days: {', '.join(overlap_days)}"
+                    })
+                    conflict = True
+                    break
+        if conflict:
+            continue
+        # create_multiple_schedules (Calendar wali API) me create karte waqt
+        schedule = SilentModeSchedule(
+            user_id=item.userId,
+            from_time=item.from_time,
+            to_time=item.to_time,
+            days=item.days,
+            active=True,
+            is_calendar_event=True   # 👈 calendar flag set
+        )
+
+        db.add(schedule)
+        db.commit()
+        db.refresh(schedule)
+
+        created_schedules.append({
+            "schedule_id": schedule.id,
+            "userId": schedule.user_id,
+            "from_time": schedule.from_time,
+            "to_time": schedule.to_time,
+            "selected_days": schedule.days.split(","),
+            "isTimerEnabled": schedule.active
+        })
+
+    return {
+        "status": "1" if created_schedules else "0",
+        "message": "Schedules processed.",
+        "created": created_schedules,
+        "failed": failed_schedules
     }
